@@ -238,6 +238,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, Mirror
   /// The app opens the PIN screen by itself once each time the phone locks.
   private var pinScreenOpened = false
   private var openingPINScreen = false
+  private var submittingPIN = false
   private let mirrorView = MirrorView()
   private let overlay = NSHostingView(rootView: MirrorOverlay(text: "", busy: true))
   private let notice = NSHostingView(rootView: InputBlockedNotice(maker: "", close: {}))
@@ -402,9 +403,9 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, Mirror
     guard computer, !unlocking else { return openSession() }
     let check = UUID()
     lockCheck = check
-    isLocked { [weak self] locked in
+    PhoneUnlock.isLocked(phone.transport) { [weak self] locked in
       guard let self, self.lockCheck == check, self.computer, self.session == nil else { return }
-      if locked { self.waitForUnlock() }
+      if locked == true { self.waitForUnlock() }
       self.openSession()
     }
   }
@@ -421,15 +422,6 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, Mirror
     keyMapper.control = session.input
     self.session = session
     session.start()
-  }
-
-  private func isLocked(_ done: @escaping @MainActor (Bool) -> Void) {
-    let transport = phone.transport
-    DispatchQueue.global().async {
-      let policy = ADB.shell(transport, "dumpsys window policy | grep -A1 KeyguardServiceDelegate")
-      let locked = policy.contains("showing=true")
-      DispatchQueue.main.async { done(locked) }
-    }
   }
 
   /// Shows the phone's lock screen, to unlock from here, and opens the desktop once it is unlocked.
@@ -585,38 +577,38 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, Mirror
 
   /// Opens the phone's PIN screen, types the PIN there and checks that the phone opened.
   private func unlock(with pin: String, saved: Bool) {
+    guard let session else { return }
     let model = unlockModel
-    model.working = true
+    setSubmittingPIN(true)
     model.problem = nil
     model.pin = String(repeating: "•", count: pin.count)
     showUnlockCard(true)
     let transport = phone.transport
     let id = phone.id
     DispatchQueue.global().async { [weak self] in
-      let ready = PhoneUnlock.openPINScreen(transport)
+      let ready = PhoneUnlock.openPINScreen(transport, wakeBeforeChecking: true)
       DispatchQueue.main.async {
         guard let self else { return }
-        guard ready, let input = self.session?.input else {
-          model.working = false
+        guard ready, self.session === session else {
+          self.setSubmittingPIN(false)
           model.pin = ""
           model.problem = String(localized: "Couldn't open the phone's PIN screen.")
           return
         }
-        input.text(pin)
-        input.tap(66)  // Enter
-        self.confirmUnlock(tries: 3) { opened in
-          model.working = false
+        session.input.text(pin)
+        session.input.tap(66)  // Enter
+        PhoneUnlock.confirmUnlock(transport) { [weak self] opened in
+          guard let self else { return }
+          self.setSubmittingPIN(false)
           model.pin = ""
-          if opened {
-            if self.phoneScreenOff, self.app == nil {
-              self.session?.input.setScreenPower(on: false)
-            }
+          guard self.session === session else { return }
+          if opened == true {
             self.phoneLocked = false
             self.touchIDAsked = false
             self.showUnlockCard(false)
             self.checkLock()
             if !saved { self.offerTouchID(for: pin) }
-          } else {
+          } else if opened == false {
             if saved { PhonePIN.delete(id) }
             model.saved = PhonePIN.isSaved(id)
             model.wrong += 1
@@ -627,6 +619,12 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, Mirror
         }
       }
     }
+  }
+
+  private func setSubmittingPIN(_ active: Bool) {
+    submittingPIN = active
+    unlockModel.working = active
+    if phoneScreenOff { session?.input.setScreenPower(on: active) }
   }
 
   /// Phones already offered Touch ID since the app opened.
@@ -647,15 +645,6 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, Mirror
     alert.beginSheetModal(for: window) { response in
       guard response == .alertFirstButtonReturn else { return }
       PhonePIN.save(pin, for: id)
-    }
-  }
-
-  private func confirmUnlock(tries: Int, _ done: @escaping @MainActor (Bool) -> Void) {
-    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-      self?.isLocked { locked in
-        if !locked || tries <= 1 { return done(!locked) }
-        self?.confirmUnlock(tries: tries - 1, done)
-      }
     }
   }
 
@@ -686,11 +675,13 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, Mirror
     guard session === self.session else { return }
     retries = 0
     // The phone window, on the phone's screen or its desktop, owns the screen switch.
-    guard phoneScreenOff, app == nil else { return }
+    guard phoneScreenOff, app == nil, !submittingPIN else { return }
     session.input.setScreenPower(on: false)
     // A session that just ended lights the screen again as it cleans up; turn it off after it.
     DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-      guard let self, session === self.session, self.phoneScreenOff else { return }
+      guard let self, session === self.session, self.phoneScreenOff, !self.submittingPIN else {
+        return
+      }
       session.input.setScreenPower(on: false)
     }
   }
@@ -1027,7 +1018,7 @@ final class MirrorWindowController: NSWindowController, NSWindowDelegate, Mirror
     // An app window passes it on: the phone window keeps the screen dark and shows the sun.
     if app != nil { return MirrorManager.shared.phoneWindow(of: phone)?.togglePhoneScreen() ?? () }
     phoneScreenOff.toggle()
-    session?.input.setScreenPower(on: !phoneScreenOff)
+    session?.input.setScreenPower(on: submittingPIN || !phoneScreenOff)
     buttons.update(screenOn: !phoneScreenOff)
   }
 

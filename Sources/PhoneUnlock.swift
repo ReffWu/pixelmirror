@@ -8,29 +8,54 @@ import SwiftUI
 enum PhoneUnlock {
   /// The PIN screen is the only one that captures as pure black, a tiny PNG.
   private static let black = "[ $(screencap -p | wc -c) -lt 100000 ]"
+  private static let keyguard = "dumpsys window policy | grep -A1 KeyguardServiceDelegate"
 
   /// Whether the phone is locked and, only then, whether its PIN screen is open.
   static func state(_ transport: String) -> (locked: Bool, pinScreen: Bool) {
     let script = """
-      dumpsys window policy | grep -A1 KeyguardServiceDelegate | grep -q showing=true || exit
+      \(keyguard) | grep -q showing=true || exit
       echo locked; \(black) && echo pin
       """
     let out = ADB.shell(transport, script)
     return (out.contains("locked"), out.hasSuffix("pin"))
   }
 
+  static func isLocked(_ transport: String, _ done: @escaping @MainActor (Bool?) -> Void) {
+    DispatchQueue.global().async {
+      let policy = ADB.shell(transport, keyguard)
+      let locked = policy.contains("showing=") ? policy.contains("showing=true") : nil
+      DispatchQueue.main.async { done(locked) }
+    }
+  }
+
+  static func confirmUnlock(
+    _ transport: String, tries: Int = 3, _ done: @escaping @MainActor (Bool?) -> Void
+  ) {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+      isLocked(transport) { locked in
+        if locked == false || tries <= 1 { return done(locked.map { !$0 }) }
+        confirmUnlock(transport, tries: tries - 1, done)
+      }
+    }
+  }
+
   /// Wakes the phone and opens its PIN screen, unless it is open already.
   /// A key opens it straight from the lock screen; a tap near the top first
   /// leaves the dimmed fingerprint prompt, which ignores keys.
-  static func openPINScreen(_ transport: String) -> Bool {
+  static func openPINScreen(_ transport: String, wakeBeforeChecking: Bool = false) -> Bool {
+    let wake = "input keyevent KEYCODE_WAKEUP"
     let script = """
-      black() { \(black); }
-      black && { echo ready; exit; }
-      input keyevent KEYCODE_WAKEUP
+      locked() { \(keyguard) | grep -q showing=true; }
+      pin_ready() { \(black) && locked; }
+      locked || exit
+      \(wakeBeforeChecking ? wake + "; sleep 0.3" : "")
+      pin_ready && { echo ready; exit; }
+      \(wakeBeforeChecking ? "" : wake)
       set -- $(wm size | grep -o '[0-9]*x[0-9]*' | tail -1 | tr x ' ')
       for try in 1 2; do
+        locked || exit
         input keyevent KEYCODE_SPACE
-        for wait in 1 2 3 4 5; do sleep 0.3; black && { echo ready; exit; }; done
+        for wait in 1 2 3 4 5; do sleep 0.3; pin_ready && { echo ready; exit; }; done
         input tap $(($1/2)) $(($2/6)); sleep 0.5
       done
       """
